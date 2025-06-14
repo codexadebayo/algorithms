@@ -3,8 +3,12 @@ from typing import Tuple, Optional
 import os
 from datetime import datetime
 
+
+
+# a good attempt but needs more work
 class EditPDF:
     def __init__(self, input_path: str = None):
+    
         """
         Initialize the PDF editor.
         
@@ -15,9 +19,12 @@ class EditPDF:
         self.pdf_document = None
         self.current_page = None
         self.modified_pages = set()
+        self.output_path = None
 
     def __enter__(self):
         """Context manager entry point"""
+        if not self.input_path:
+            raise ValueError("Input path must be set before using context manager")
         self.open_document()
         return self
 
@@ -41,7 +48,6 @@ class EditPDF:
         Generate a unique output path for the modified PDF.
         
         Returns:
-
             str: Path for the output PDF file
         """
         if not self.input_path:
@@ -55,6 +61,8 @@ class EditPDF:
 
     def open_document(self) -> None:
         """Open the PDF document"""
+        if not self.input_path:
+            raise ValueError("Input path not set")
         try:
             self.pdf_document = fitz.open(self.input_path)
         except Exception as e:
@@ -65,20 +73,8 @@ class EditPDF:
         if self.pdf_document:
             self.pdf_document.close()
             self.pdf_document = None
-
-    def get_page_count(self) -> int:
-        """
-        Get the total number of pages in the PDF document.
-        
-        Returns:
-            int: Total number of pages in the document
-            
-        Raises:
-            Exception: If PDF document is not opened
-        """
-        if not self.pdf_document:
-            raise Exception("PDF document not opened")
-        return self.pdf_document.page_count
+            self.current_page = None
+            self.modified_pages.clear()
 
     def validate_page_number(self, page_number: int) -> bool:
         """
@@ -105,31 +101,13 @@ class EditPDF:
             raise ValueError(f"Invalid page number: {page_number}")
         self.current_page = self.pdf_document.load_page(page_number - 1)
 
-    def find_text_location(self, target_text: str) -> Optional[Tuple[float, float, float, float]]:
-        """
-        Find the location of specific text on the current page.
-        
-        Args:
-            target_text (str): Text to search for
-            
-        Returns:
-            Optional[Tuple[float, float, float, float]]: Bounding box coordinates if found, None otherwise
-        """
-        if not self.current_page:
-            raise Exception("No page loaded")
-
-        text_instances = self.current_page.get_text("dict")
-        for text in text_instances:
-            if text["type"] == "text" and text["text"].strip() == target_text.strip():
-                return text["bbox"]
-        return None
-
-    def find_text_in_document(self, target_text: str) -> list:
+    def find_text_in_document(self, old_text: str, target_page: int = None) -> list:
         """
         Find all occurrences of text across all pages in the document.
         
         Args:
-            target_text (str): Text to search for
+            old_text (str): Text to search for
+            target_page (int, optional): Specific page number to search in. If None, searches all pages.
             
         Returns:
             list: List of tuples containing (page_number, bbox) for each occurrence
@@ -137,22 +115,43 @@ class EditPDF:
         if not self.pdf_document:
             raise Exception("PDF document not opened")
             
+        if not old_text or not old_text.strip():
+            raise ValueError("Search text cannot be empty")
+            
         occurrences = []
-        for page_num in range(self.pdf_document.page_count):
+        # If target_page is specified, only search that page
+        pages_to_search = [target_page - 1] if target_page else range(self.pdf_document.page_count)
+        
+        print(f"Searching for text: '{old_text}'")
+        print(f"Pages to search: {[p+1 for p in pages_to_search]}")
+        
+        for page_num in pages_to_search:
+            if target_page and not self.validate_page_number(target_page):
+                raise ValueError(f"Invalid target page number: {target_page}")
+                
             page = self.pdf_document.load_page(page_num)
             text_instances = page.get_text("dict")
-            for text in text_instances:
-                if text["type"] == "text" and target_text.strip() in text["text"].strip():
-                    occurrences.append((page_num + 1, text["bbox"]))
+            
+            for block in text_instances.get("blocks", []):
+                if block.get("type") == 0:  # Text block
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            span_text = span.get("text", "").strip()
+                            if old_text.strip() in span_text:
+                                print(f"Found match on page {page_num + 1}: '{span_text}'")
+                                occurrences.append((page_num + 1, span["bbox"]))
+        
+        print(f"Total occurrences found: {len(occurrences)}")
         return occurrences
 
-    def replace_text(self, old_text: str, new_text: str) -> bool:
+    def replace_text(self, old_text: str, new_text: str, target_page: int = None) -> bool:
         """
         Replace all occurrences of text in the document.
         
         Args:
             old_text (str): Text to be replaced
             new_text (str): New text to insert
+            target_page (int, optional): Specific page number to make changes in. If None, changes all pages.
             
         Returns:
             bool: True if any replacements were made
@@ -160,45 +159,75 @@ class EditPDF:
         if not self.pdf_document:
             raise Exception("PDF document not opened")
 
-        occurrences = self.find_text_in_document(old_text)
+        if not new_text or not new_text.strip():
+            raise ValueError("Replacement text cannot be empty")
+
+        occurrences = self.find_text_in_document(old_text, target_page)
         if not occurrences:
+            print("No text occurrences found to replace")
             return False
 
+        print(f"Replacing {len(occurrences)} occurrences of text")
         for page_num, bbox in occurrences:
             page = self.pdf_document.load_page(page_num - 1)
-            # Draw white rectangle to cover old text
-            page.draw_rect(bbox, fill=(1, 1, 1), overlay=True)
             
-            # Insert new text
-            page.insert_textbox(
-                bbox,
+            # Calculate text dimensions for proper positioning
+            text_width = fitz.get_text_length(new_text, fontsize=12)
+            text_height = 12  # Approximate height for fontsize 12
+            
+            # Create a larger white background to ensure full coverage
+            padding = 4
+            extra_width = max(20, text_width * 0.2)  # 20% extra width or minimum 20 points
+            
+            bg_rect = fitz.Rect(
+                bbox[0] - padding,
+                bbox[1] - padding,
+                bbox[0] + text_width + extra_width + padding,
+                bbox[1] + text_height + padding
+            )
+            
+            # Draw white rectangle without border
+            page.draw_rect(bg_rect, fill=(1, 1, 1), color=None, overlay=True)
+            
+            # Insert new text at the original position
+            page.insert_text(
+                (bbox[0], bbox[1] + text_height),  # Position text at bottom of bbox
                 new_text,
-                fontname="Arial",
                 fontsize=12,
-                align=fitz.TEXT_ALIGN_LEFT,
                 color=(0, 0, 0)
             )
             self.modified_pages.add(page_num)
+            print(f"Replaced text on page {page_num}")
         
         return True
 
-    def process_edit(self, old_text: str, new_text: str) -> str:
+    def process_edit(self, old_text: str, new_text: str, target_page: int = None) -> Optional[str]:
         """
         Process the complete edit workflow.
         
         Args:
             old_text (str): Text to be replaced
             new_text (str): New text to insert
+            target_page (int, optional): Specific page number to make changes in. If None, changes all pages.
             
         Returns:
-            str: Path to the saved modified PDF
+            Optional[str]: Path to the saved modified PDF if successful, None otherwise
         """
+        if not self.input_path:
+            raise ValueError("Input path not set. Use set_input_path() first.")
+
         try:
+            print(f"Processing edit: '{old_text}' -> '{new_text}'")
+            if target_page:
+                print(f"Target page: {target_page}")
+            
             self.open_document()
-            if self.replace_text(old_text, new_text):
-                output_path = self.generate_output_path()
-                self.save_document(output_path)
-                return output_path
+            if self.replace_text(old_text, new_text, target_page):
+                self.output_path = self.generate_output_path()
+                print(f"Saving modified PDF to: {self.output_path}")
+                self.save_document(self.output_path)
+                return self.output_path
+            print("No changes were made to the document")
             return None
         except Exception as e:
             print(f"Error processing PDF edit: {str(e)}")
@@ -215,5 +244,10 @@ class EditPDF:
         """
         if not self.pdf_document:
             raise Exception("PDF document not opened")
-        self.pdf_document.save(output_path)
+        
+        try:
+            self.pdf_document.save(output_path)
+            print(f"Successfully saved PDF to: {output_path}")
+        except Exception as e:
+            raise Exception(f"Failed to save PDF: {str(e)}")
 
